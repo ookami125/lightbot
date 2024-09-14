@@ -90,16 +90,7 @@ func uploadAllMessages(s *discordgo.Session, m *discordgo.MessageCreate) {
 	}
 
 	for _, channel := range channels {
-		log.Println(channel.Name)
-
 		if channel.ID == channel_id {
-			return
-		}
-
-		if channel.Type == discordgo.ChannelTypeGuildVoice {
-			continue
-		}
-		if channel.Type == discordgo.ChannelTypeGuildCategory {
 			continue
 		}
 
