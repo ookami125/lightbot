@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -44,6 +45,7 @@ func main() {
 	defer db.Close()
 
 	discord.AddHandler(messageCreateHandler)
+	discord.AddHandler(messageEditHandler)
 	discord.AddHandler(messageDeleteHandler)
 
 	discord.Identify.Intents = discordgo.IntentsGuildMessages
@@ -69,15 +71,13 @@ func initDB() (*sql.DB, error) {
 	sqlCreateMessagesTable := `CREATE TABLE messages (message_id INTEGER NOT NULL PRIMARY KEY, user_id INTEGER NOT NULL, username TEXT, content TEXT);`
 	_, err = db.Exec(sqlCreateMessagesTable)
 	if err != nil {
-		log.Printf("%q: %s\n", err, sqlCreateMessagesTable)
-		//return nil, err
+		logWarning(err)
 	}
 
 	sqlCreateAttachmentsTable := `CREATE TABLE attachments (attachment_id INTEGER NOT NULL PRIMARY KEY, message_id INTEGER NOT NULL, filename STRING, url STRING);`
 	_, err = db.Exec(sqlCreateAttachmentsTable)
 	if err != nil {
-		log.Printf("%q: %s\n", err, sqlCreateAttachmentsTable)
-		//return nil, err
+		logWarning(err)
 	}
 
 	return db, nil
@@ -105,13 +105,13 @@ func uploadAllMessages(s *discordgo.Session, m *discordgo.MessageCreate) {
 
 		dyn_message, err := s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Loading %s!", channel.Name))
 		if err != nil {
-			log.Printf("ERROR: %q\n", err)
+			logError(err)
 			return
 		}
 
 		tx, err := db.Begin()
 		if err != nil {
-			log.Printf("ERROR: %q\n", err)
+			logError(err)
 			return
 		}
 
@@ -121,11 +121,12 @@ func uploadAllMessages(s *discordgo.Session, m *discordgo.MessageCreate) {
 			s.ChannelMessageEdit(m.ChannelID, dyn_message.ID, fmt.Sprintf("Loading %s (%d+)!", channel.Name, count))
 			messages, err := s.ChannelMessages(channel.ID, 100, last_message_id, "", "")
 			if err != nil {
+				logError(err)
 				s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Failed to init db! Err: %q", err))
 			}
 
 			for _, message := range messages {
-				storeMessage(tx, message)
+				upsertMessage(tx, fromMessage(message))
 				last_message_id = message.ID
 			}
 
@@ -139,24 +140,6 @@ func uploadAllMessages(s *discordgo.Session, m *discordgo.MessageCreate) {
 		err = tx.Commit()
 		if err != nil {
 			log.Fatal(err)
-		}
-	}
-}
-
-func storeMessage(tx *sql.Tx, m *discordgo.Message) {
-	sqlAddMessage := `INSERT OR IGNORE INTO messages(message_id, user_id, username, content) VALUES (?, ?, ?, ?)`
-	_, err := tx.Exec(sqlAddMessage, m.ID, m.Author.ID, m.Author.GlobalName, m.Content)
-	if err != nil {
-		log.Printf("%q\n", err)
-		return
-	}
-
-	sqlAddAttachment := `INSERT OR IGNORE INTO attachments(attachment_id, message_id, filename, url) VALUES (?, ?, ?, ?)`
-	for _, attachment := range m.Attachments {
-		_, err := tx.Exec(sqlAddAttachment, attachment.ID, m.ID, attachment.Filename, attachment.URL)
-		if err != nil {
-			log.Printf("%q\n", err)
-			return
 		}
 	}
 }
@@ -177,15 +160,70 @@ func messageCreateHandler(s *discordgo.Session, m *discordgo.MessageCreate) {
 
 	tx, err := db.Begin()
 	if err != nil {
-		log.Printf("ERROR: %q\n", err)
+		logError(err)
 		return
 	}
 
-	storeMessage(tx, m.Message)
+	insertMessage(fromMessageCreate(m))
 
 	err = tx.Commit()
 	if err != nil {
-		log.Printf("ERROR: %q\n", err)
+		logError(err)
+		return
+	}
+}
+
+func escapeMessage(content string) string {
+	if content == "" {
+		return "<Empty>"
+	}
+
+	content = strings.ReplaceAll(content, "`", "'")
+	content = "```" + content + "```"
+
+	return content
+}
+
+func messageEditHandler(s *discordgo.Session, m *discordgo.MessageUpdate) {
+	if m.ChannelID == channel_id {
+		return
+	}
+
+	id, err := strconv.Atoi(m.ID)
+	if err != nil {
+		logError(err)
+		return
+	}
+	message, err := selectMessage(id)
+	if err != nil {
+		logError(err)
+		return
+	}
+
+	oldContent := escapeMessage(message.content)
+	newContent := escapeMessage(m.Content)
+
+	discord_msg := fmt.Sprintf("Message altered:\n\tID=%s\n\tChannelID=%s\n\tUser: %s <@%d>\n\tBefore:%s\n\tAfter:%s", m.ID, m.ChannelID, message.author.globalName, message.author.id, oldContent, newContent)
+
+	s.ChannelMessageSendComplex(channel_id, &discordgo.MessageSend{
+		Content:         discord_msg,
+		AllowedMentions: &discordgo.MessageAllowedMentions{},
+	})
+
+	tx, err := db.Begin()
+	if err != nil {
+		logError(err)
+		return
+	}
+
+	message.content = m.Content
+	message.author.globalName = m.Author.GlobalName
+
+	upsertMessage(tx, message)
+
+	err = tx.Commit()
+	if err != nil {
+		logError(err)
 		return
 	}
 }
@@ -195,72 +233,32 @@ func messageDeleteHandler(s *discordgo.Session, m *discordgo.MessageDelete) {
 		return
 	}
 
-	sqlGetMessage := `SELECT user_id, username, content FROM messages WHERE message_id=?`
-	rows, err := db.Query(sqlGetMessage, m.ID)
+	id, err := strconv.Atoi(m.ID)
 	if err != nil {
-		log.Printf("%q: %s\n", err, sqlGetMessage)
+		logError(err)
 		return
 	}
-	defer rows.Close()
-
-	flag := true
-	for rows.Next() {
-		var user_id int
-		var username string
-		var content string
-		err = rows.Scan(&user_id, &username, &content)
-		if err != nil {
-			log.Printf("ERROR: %q\n", err)
-			break
-		}
-
-		content = strings.ReplaceAll(content, "`", "'")
-
-		if content == "" {
-			content = "<Empty>"
-		} else {
-			content = "```" + content + "```"
-		}
-
-		msg := fmt.Sprintf("Message deleted:\n\tID=%s\n\tChannelID=%s\n\tUser: %s <@%d>\n\tContent:%s", m.ID, m.ChannelID, username, user_id, content)
-
-		sqlGetMessage := `SELECT attachment_id, filename, url FROM attachments WHERE message_id=?`
-		attach_rows, err := db.Query(sqlGetMessage, m.ID)
-		if err != nil {
-			log.Printf("%q: %s\n", err, sqlGetMessage)
-		} else {
-			defer attach_rows.Close()
-
-			attach_first := true
-			for attach_rows.Next() {
-				var attachment_id int
-				var filename string
-				var url string
-				err = attach_rows.Scan(&attachment_id, &filename, &url)
-				if err != nil {
-					log.Println(err)
-					continue
-				}
-
-				if attach_first {
-					attach_first = false
-					msg = fmt.Sprintf("%s\n\tAttachments:", msg)
-				}
-
-				msg = fmt.Sprintf("%s\n\tID: %d [%s](%s):", msg, attachment_id, filename, url)
-			}
-		}
-
-		var complex_msg = &discordgo.MessageSend{
-			Content:         msg,
-			AllowedMentions: &discordgo.MessageAllowedMentions{},
-		}
-
-		s.ChannelMessageSendComplex(channel_id, complex_msg)
-		flag = false
+	message, err := selectMessage(id)
+	if err != nil {
+		logError(err)
+		return
 	}
 
-	if flag {
-		s.ChannelMessageSend(channel_id, fmt.Sprintf("Message deleted but no data stored!\n\tID=%s\n\tChannelID=%s", m.ID, m.ChannelID))
+	content := escapeMessage(message.content)
+
+	discord_msg := fmt.Sprintf("Message deleted:\n\tID=%s\n\tChannelID=%s\n\tUser: %s <@%d>\n\tContent:%s", m.ID, m.ChannelID, message.author.globalName, message.author.id, content)
+
+	if len(message.attachments) > 0 {
+		discord_msg = fmt.Sprintf("%s\n\tAttachments:", discord_msg)
 	}
+
+	for _, attachment := range message.attachments {
+		discord_msg = fmt.Sprintf("%s\n\tID: %d [%s](%s):", discord_msg, attachment.id, attachment.filename, attachment.url)
+
+	}
+
+	s.ChannelMessageSendComplex(channel_id, &discordgo.MessageSend{
+		Content:         discord_msg,
+		AllowedMentions: &discordgo.MessageAllowedMentions{},
+	})
 }
