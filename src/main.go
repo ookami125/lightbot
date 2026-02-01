@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/joho/godotenv"
@@ -23,6 +24,7 @@ var token string
 var channel_id string
 var msgCache map[string]Message
 var msgCacheMu sync.RWMutex
+var timeLocation *time.Location
 
 func main() {
 	err := godotenv.Load()
@@ -33,6 +35,7 @@ func main() {
 
 	token = os.Getenv("TOKEN")
 	channel_id = os.Getenv("CHANNEL")
+	timeLocation = loadTimeLocation(os.Getenv("TIMEZONE"))
 
 	discord, err := discordgo.New(fmt.Sprintf("Bot %s", token))
 	if err != nil {
@@ -54,7 +57,15 @@ func main() {
 	discord.AddHandler(messageEditHandler)
 	discord.AddHandler(messageDeleteHandler)
 
-	discord.Identify.Intents = discordgo.IntentsGuildMessages
+	ready := make(chan struct{})
+	var readyOnce sync.Once
+	discord.AddHandler(func(s *discordgo.Session, r *discordgo.Ready) {
+		readyOnce.Do(func() {
+			close(ready)
+		})
+	})
+
+	discord.Identify.Intents = discordgo.IntentsGuildMessages | discordgo.IntentsGuilds
 
 	err = discord.Open()
 	if err != nil {
@@ -62,10 +73,32 @@ func main() {
 		return
 	}
 
+	select {
+	case <-ready:
+	case <-time.After(10 * time.Second):
+		log.Println("Warning: Timed out waiting for READY event.")
+	}
+
+	lastRun, ok, err := getLastRun()
+	if err != nil {
+		logError(err)
+	} else if ok {
+		log.Printf("Refreshing messages since %s", lastRun.UTC().Format(time.RFC3339))
+		if err := refreshMessagesSince(discord, lastRun); err != nil {
+			logError(err)
+		}
+	}
+
 	fmt.Println("Bot is now running.  Press CTRL-C to exit.")
 	sc := make(chan os.Signal, 1)
 	signal.Notify(sc, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
 	<-sc
+
+	now := time.Now().UTC()
+	log.Printf("Recording last run time: %s", now.Format(time.RFC3339))
+	if err := setLastRun(now); err != nil {
+		logError(err)
+	}
 }
 
 func initDB() (*sql.DB, error) {
@@ -86,17 +119,27 @@ func initDB() (*sql.DB, error) {
 		logWarning(err)
 	}
 
+	sqlCreateMetadataTable := `CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT);`
+	_, err = db.Exec(sqlCreateMetadataTable)
+	if err != nil {
+		logWarning(err)
+	}
+
 	return db, nil
 }
 
 func uploadAllMessages(s *discordgo.Session, m *discordgo.MessageCreate) {
+	uploadMessagesSince(s, m, time.Time{})
+}
+
+func uploadMessagesSince(s *discordgo.Session, m *discordgo.MessageCreate, since time.Time) {
 	channels, err := s.GuildChannels(m.GuildID)
 	if err != nil {
 		s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Failed to init db! Err: %q", err))
 	}
 
 	for _, channel := range channels {
-		if channel.ID == channel_id {
+		if channel.ID == channel_id || channel.Type != discordgo.ChannelTypeGuildText {
 			continue
 		}
 
@@ -106,38 +149,11 @@ func uploadAllMessages(s *discordgo.Session, m *discordgo.MessageCreate) {
 			return
 		}
 
-		tx, err := db.Begin()
+		count, err := backfillChannelMessages(s, channel.ID, since)
 		if err != nil {
 			logError(err)
-			return
-		}
-
-		last_message_id := ""
-		count := 0
-		for {
-			s.ChannelMessageEdit(m.ChannelID, dyn_message.ID, fmt.Sprintf("Loading %s (%d+)!", channel.Name, count))
-			messages, err := s.ChannelMessages(channel.ID, 100, last_message_id, "", "")
-			if err != nil {
-				logError(err)
-				s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Failed to init db! Err: %q", err))
-			}
-
-			for _, message := range messages {
-				upsertMessage(tx, fromMessage(message))
-				last_message_id = message.ID
-			}
-
-			count += len(messages)
-			if len(messages) < 100 {
-				break
-			}
 		}
 		s.ChannelMessageEdit(m.ChannelID, dyn_message.ID, fmt.Sprintf("Loading %s (%d)!", channel.Name, count))
-
-		err = tx.Commit()
-		if err != nil {
-			log.Fatal(err)
-		}
 	}
 }
 
@@ -148,9 +164,21 @@ func messageCreateHandler(s *discordgo.Session, m *discordgo.MessageCreate) {
 
 	if m.ChannelID == channel_id {
 		if strings.HasPrefix(m.Content, "/init_db") {
-			s.ChannelMessageSend(m.ChannelID, "Starting DB Init!")
-			uploadAllMessages(s, m)
-			s.ChannelMessageSend(m.ChannelID, "DB Init Done!")
+			arg := strings.TrimSpace(strings.TrimPrefix(m.Content, "/init_db"))
+			if arg == "" {
+				s.ChannelMessageSend(m.ChannelID, "Starting DB Init!")
+				uploadAllMessages(s, m)
+				s.ChannelMessageSend(m.ChannelID, "DB Init Done!")
+			} else {
+				since, err := parseDateArg(arg)
+				if err != nil {
+					s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Invalid date format: %s", err))
+				} else {
+					s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Starting DB Init since %s!", since.UTC().Format(time.RFC3339)))
+					uploadMessagesSince(s, m, since)
+					s.ChannelMessageSend(m.ChannelID, "DB Init Done!")
+				}
+			}
 		}
 		return
 	}
@@ -488,6 +516,124 @@ func appendList(b *strings.Builder, items []string) {
 		b.WriteString("\n\t- ")
 		b.WriteString(item)
 	}
+}
+
+func refreshMessagesSince(s *discordgo.Session, since time.Time) error {
+	if since.IsZero() {
+		return nil
+	}
+
+	if len(s.State.Guilds) == 0 {
+		return fmt.Errorf("no guilds available in state (IntentsGuilds required)")
+	}
+
+	for _, guild := range s.State.Guilds {
+		channels, err := s.GuildChannels(guild.ID)
+		if err != nil {
+			logError(err)
+			continue
+		}
+		for _, channel := range channels {
+			if channel.ID == channel_id || channel.Type != discordgo.ChannelTypeGuildText {
+				continue
+			}
+			count, err := backfillChannelMessages(s, channel.ID, since)
+			if err != nil {
+				logError(err)
+				continue
+			}
+			log.Printf("Refreshed %d messages from #%s", count, channel.Name)
+		}
+	}
+
+	return nil
+}
+
+func backfillChannelMessages(s *discordgo.Session, channelID string, since time.Time) (int, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, err
+	}
+
+	lastMessageID := ""
+	total := 0
+	done := false
+
+	for {
+		messages, err := s.ChannelMessages(channelID, 100, lastMessageID, "", "")
+		if err != nil {
+			tx.Rollback()
+			return total, err
+		}
+		if len(messages) == 0 {
+			break
+		}
+
+		for _, message := range messages {
+			if !since.IsZero() && message.Timestamp.Before(since) {
+				done = true
+				break
+			}
+
+			if err := upsertMessage(tx, fromMessage(message)); err != nil {
+				tx.Rollback()
+				return total, err
+			}
+			total++
+		}
+
+		if done || len(messages) < 100 {
+			break
+		}
+		lastMessageID = messages[len(messages)-1].ID
+	}
+
+	if err := tx.Commit(); err != nil {
+		return total, err
+	}
+
+	return total, nil
+}
+
+func parseDateArg(input string) (time.Time, error) {
+	if t, err := time.Parse(time.RFC3339Nano, input); err == nil {
+		return t, nil
+	}
+	if t, err := time.Parse(time.RFC3339, input); err == nil {
+		return t, nil
+	}
+
+	layouts := []string{
+		"2006-01-02 15:04:05",
+		"2006-01-02 15:04",
+		"2006-01-02",
+	}
+
+	loc := timeLocation
+	if loc == nil {
+		loc = time.UTC
+	}
+
+	for _, layout := range layouts {
+		if t, err := time.ParseInLocation(layout, input, loc); err == nil {
+			return t, nil
+		}
+	}
+
+	return time.Time{}, fmt.Errorf("use RFC3339 or YYYY-MM-DD (got %q)", input)
+}
+
+func loadTimeLocation(tz string) *time.Location {
+	if tz == "" {
+		return time.UTC
+	}
+	loc, err := time.LoadLocation(tz)
+	if err != nil {
+		log.Printf("Invalid TIMEZONE %q, defaulting to UTC: %v", tz, err)
+		return time.UTC
+	}
+	log.Printf("Using TIMEZONE %s", loc.String())
+	return loc
 }
 
 func cacheMessage(messageID string, message Message) {

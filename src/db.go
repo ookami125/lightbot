@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"time"
 )
 
 func insertMessage(message Message) error {
@@ -114,4 +115,44 @@ func selectMessage(message_id int) (Message, error) {
 	}
 
 	return Message{}, &ErrorNoResults{id: message_id}
+}
+
+func setMetadata(key, value string) error {
+	_, err := db.Exec(`INSERT INTO metadata (key, value) VALUES (?, ?)
+ON CONFLICT(key)
+DO UPDATE SET value = excluded.value`, key, value)
+	return err
+}
+
+func getMetadata(key string) (string, bool, error) {
+	var value string
+	err := db.QueryRow(`SELECT value FROM metadata WHERE key = ?`, key).Scan(&value)
+	if err == sql.ErrNoRows {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return value, true, nil
+}
+
+func setLastRun(t time.Time) error {
+	return setMetadata("last_run", t.UTC().Format(time.RFC3339Nano))
+}
+
+func getLastRun() (time.Time, bool, error) {
+	value, ok, err := getMetadata("last_run")
+	if err != nil || !ok {
+		return time.Time{}, ok, err
+	}
+
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err == nil {
+		return parsed, true, nil
+	}
+	parsed, err = time.Parse(time.RFC3339, value)
+	if err == nil {
+		return parsed, true, nil
+	}
+	return time.Time{}, false, err
 }
