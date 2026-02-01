@@ -6,8 +6,10 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/bwmarrin/discordgo"
@@ -19,6 +21,8 @@ var db *sql.DB = nil
 
 var token string
 var channel_id string
+var msgCache map[string]Message
+var msgCacheMu sync.RWMutex
 
 func main() {
 	err := godotenv.Load()
@@ -43,6 +47,8 @@ func main() {
 		log.Fatal("Error initializing db")
 	}
 	defer db.Close()
+
+	msgCache = make(map[string]Message)
 
 	discord.AddHandler(messageCreateHandler)
 	discord.AddHandler(messageEditHandler)
@@ -149,6 +155,8 @@ func messageCreateHandler(s *discordgo.Session, m *discordgo.MessageCreate) {
 		return
 	}
 
+	cacheMessage(m.ID, fromMessageCreate(m))
+
 	tx, err := db.Begin()
 	if err != nil {
 		logError(err)
@@ -180,26 +188,54 @@ func messageEditHandler(s *discordgo.Session, m *discordgo.MessageUpdate) {
 		return
 	}
 
-	id, err := strconv.Atoi(m.ID)
+	if m.ID == "" || m.ChannelID == "" {
+		return
+	}
+
+	updated, err := s.ChannelMessage(m.ChannelID, m.ID)
 	if err != nil {
 		logError(err)
 		return
 	}
-	message, err := selectMessage(id)
-	if err != nil {
-		logError(err)
+	if updated.Author != nil && updated.Author.ID == s.State.User.ID {
 		return
 	}
 
-	oldContent := escapeMessage(message.content)
-	newContent := escapeMessage(m.Content)
+	after := fromMessage(updated)
 
-	discord_msg := fmt.Sprintf("Message altered:\n\tID=%s\n\tChannelID=%s\n\tUser: %s <@%d>\n\tBefore:%s\n\tAfter:%s", m.ID, m.ChannelID, message.author.globalName, message.author.id, oldContent, newContent)
+	before, ok := getCachedMessage(updated.ID)
+	includeEmbeds := ok
 
-	s.ChannelMessageSendComplex(channel_id, &discordgo.MessageSend{
-		Content:         discord_msg,
-		AllowedMentions: &discordgo.MessageAllowedMentions{},
-	})
+	if !ok && m.BeforeUpdate != nil {
+		before = fromMessage(m.BeforeUpdate)
+		ok = true
+		includeEmbeds = true
+	}
+
+	if !ok {
+		id, err := strconv.Atoi(updated.ID)
+		if err == nil {
+			message, err := selectMessage(id)
+			if err == nil {
+				before = message
+				ok = true
+				includeEmbeds = false
+			}
+		}
+	}
+
+	if ok {
+		diff := diffMessages(before, after, includeEmbeds)
+		if diff.hasChanges() {
+			discordMsg := formatEditLog(updated, diff)
+			s.ChannelMessageSendComplex(channel_id, &discordgo.MessageSend{
+				Content:         discordMsg,
+				AllowedMentions: &discordgo.MessageAllowedMentions{},
+			})
+		}
+	}
+
+	cacheMessage(updated.ID, after)
 
 	tx, err := db.Begin()
 	if err != nil {
@@ -207,13 +243,13 @@ func messageEditHandler(s *discordgo.Session, m *discordgo.MessageUpdate) {
 		return
 	}
 
-	message.content = m.Content
-	message.author.globalName = m.Author.GlobalName
+	if err := upsertMessage(tx, after); err != nil {
+		logError(err)
+		tx.Rollback()
+		return
+	}
 
-	upsertMessage(tx, message)
-
-	err = tx.Commit()
-	if err != nil {
+	if err := tx.Commit(); err != nil {
 		logError(err)
 		return
 	}
@@ -252,4 +288,223 @@ func messageDeleteHandler(s *discordgo.Session, m *discordgo.MessageDelete) {
 		Content:         discord_msg,
 		AllowedMentions: &discordgo.MessageAllowedMentions{},
 	})
+
+	deleteCachedMessage(m.ID)
+}
+
+type MessageDiff struct {
+	contentChanged     bool
+	beforeContent      string
+	afterContent       string
+	attachmentsAdded   []string
+	attachmentsRemoved []string
+	embedsAdded        []string
+	embedsRemoved      []string
+}
+
+func (d MessageDiff) hasChanges() bool {
+	return d.contentChanged ||
+		len(d.attachmentsAdded) > 0 ||
+		len(d.attachmentsRemoved) > 0 ||
+		len(d.embedsAdded) > 0 ||
+		len(d.embedsRemoved) > 0
+}
+
+type mediaItem struct {
+	key   string
+	label string
+}
+
+func diffMessages(before, after Message, includeEmbeds bool) MessageDiff {
+	diff := MessageDiff{
+		beforeContent: before.content,
+		afterContent:  after.content,
+	}
+
+	diff.contentChanged = before.content != after.content
+
+	diff.attachmentsAdded, diff.attachmentsRemoved = diffMedia(
+		attachmentItems(before.attachments),
+		attachmentItems(after.attachments),
+	)
+
+	if includeEmbeds {
+		diff.embedsAdded, diff.embedsRemoved = diffMedia(
+			embedItems(before.embeds),
+			embedItems(after.embeds),
+		)
+	}
+
+	return diff
+}
+
+func diffMedia(before, after []mediaItem) ([]string, []string) {
+	beforeMap := make(map[string]string, len(before))
+	for _, item := range before {
+		beforeMap[item.key] = item.label
+	}
+	afterMap := make(map[string]string, len(after))
+	for _, item := range after {
+		afterMap[item.key] = item.label
+	}
+
+	added := []string{}
+	removed := []string{}
+	for key, label := range afterMap {
+		if _, ok := beforeMap[key]; !ok {
+			added = append(added, label)
+		}
+	}
+	for key, label := range beforeMap {
+		if _, ok := afterMap[key]; !ok {
+			removed = append(removed, label)
+		}
+	}
+
+	sort.Strings(added)
+	sort.Strings(removed)
+
+	return added, removed
+}
+
+func attachmentItems(attachments []Attachment) []mediaItem {
+	items := make([]mediaItem, 0, len(attachments))
+	for _, attachment := range attachments {
+		items = append(items, mediaItem{
+			key:   attachmentKey(attachment),
+			label: attachmentLabel(attachment),
+		})
+	}
+	return items
+}
+
+func embedItems(embeds []Embed) []mediaItem {
+	items := make([]mediaItem, 0, len(embeds))
+	for _, embed := range embeds {
+		items = append(items, mediaItem{
+			key:   embedKey(embed),
+			label: embedLabel(embed),
+		})
+	}
+	return items
+}
+
+func attachmentKey(a Attachment) string {
+	if a.url != "" {
+		return "url:" + a.url
+	}
+	if a.filename != "" {
+		return "file:" + a.filename
+	}
+	if a.id != 0 {
+		return fmt.Sprintf("id:%d", a.id)
+	}
+	return "attachment"
+}
+
+func attachmentLabel(a Attachment) string {
+	if a.filename != "" && a.url != "" {
+		return fmt.Sprintf("%s (%s)", a.filename, a.url)
+	}
+	if a.url != "" {
+		return a.url
+	}
+	if a.filename != "" {
+		return a.filename
+	}
+	if a.id != 0 {
+		return fmt.Sprintf("attachment:%d", a.id)
+	}
+	return "attachment"
+}
+
+func embedKey(e Embed) string {
+	return fmt.Sprintf("%s|%s|%s|%s", e.embedType, e.url, e.title, e.provider)
+}
+
+func embedLabel(e Embed) string {
+	if e.title != "" && e.url != "" {
+		return fmt.Sprintf("%s (%s)", e.title, e.url)
+	}
+	if e.url != "" {
+		return e.url
+	}
+	if e.title != "" {
+		return e.title
+	}
+	if e.provider != "" {
+		return e.provider
+	}
+	if e.embedType != "" {
+		return e.embedType
+	}
+	return "embed"
+}
+
+func formatEditLog(updated *discordgo.Message, diff MessageDiff) string {
+	var b strings.Builder
+
+	b.WriteString("Message altered:")
+	b.WriteString(fmt.Sprintf("\n\tID=%s", updated.ID))
+	b.WriteString(fmt.Sprintf("\n\tChannelID=%s", updated.ChannelID))
+
+	if updated.Author != nil {
+		authorName := updated.Author.GlobalName
+		if authorName == "" {
+			authorName = updated.Author.Username
+		}
+		b.WriteString(fmt.Sprintf("\n\tUser: %s <@%s>", authorName, updated.Author.ID))
+	}
+
+	if diff.contentChanged {
+		b.WriteString("\n\tBefore:")
+		b.WriteString(escapeMessage(diff.beforeContent))
+		b.WriteString("\n\tAfter:")
+		b.WriteString(escapeMessage(diff.afterContent))
+	}
+
+	if len(diff.attachmentsAdded) > 0 {
+		b.WriteString("\n\tAttachments added:")
+		appendList(&b, diff.attachmentsAdded)
+	}
+	if len(diff.attachmentsRemoved) > 0 {
+		b.WriteString("\n\tAttachments removed:")
+		appendList(&b, diff.attachmentsRemoved)
+	}
+	if len(diff.embedsAdded) > 0 {
+		b.WriteString("\n\tEmbeds added:")
+		appendList(&b, diff.embedsAdded)
+	}
+	if len(diff.embedsRemoved) > 0 {
+		b.WriteString("\n\tEmbeds removed:")
+		appendList(&b, diff.embedsRemoved)
+	}
+
+	return b.String()
+}
+
+func appendList(b *strings.Builder, items []string) {
+	for _, item := range items {
+		b.WriteString("\n\t- ")
+		b.WriteString(item)
+	}
+}
+
+func cacheMessage(messageID string, message Message) {
+	msgCacheMu.Lock()
+	msgCache[messageID] = message
+	msgCacheMu.Unlock()
+}
+
+func getCachedMessage(messageID string) (Message, bool) {
+	msgCacheMu.RLock()
+	message, ok := msgCache[messageID]
+	msgCacheMu.RUnlock()
+	return message, ok
+}
+
+func deleteCachedMessage(messageID string) {
+	msgCacheMu.Lock()
+	delete(msgCache, messageID)
+	msgCacheMu.Unlock()
 }

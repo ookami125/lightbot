@@ -17,11 +17,19 @@ type Attachment struct {
 	url      string
 }
 
+type Embed struct {
+	url       string
+	title     string
+	embedType string
+	provider  string
+}
+
 type Message struct {
 	id          int
 	author      Author
 	content     string
 	attachments []Attachment
+	embeds      []Embed
 }
 
 func toIntOr0(str string) int {
@@ -57,6 +65,30 @@ func toAttachments(a []*discordgo.MessageAttachment) []Attachment {
 	return attachments
 }
 
+func toEmbed(e *discordgo.MessageEmbed) Embed {
+	provider := ""
+	if e.Provider != nil {
+		provider = e.Provider.Name
+	}
+	return Embed{
+		url:       e.URL,
+		title:     e.Title,
+		embedType: string(e.Type),
+		provider:  provider,
+	}
+}
+
+func toEmbeds(e []*discordgo.MessageEmbed) []Embed {
+	embeds := []Embed{}
+	for _, embed := range e {
+		if embed == nil {
+			continue
+		}
+		embeds = append(embeds, toEmbed(embed))
+	}
+	return embeds
+}
+
 func fromMessageCreate(m *discordgo.MessageCreate) Message {
 	id := toIntOr0(m.ID)
 	return Message{
@@ -64,6 +96,7 @@ func fromMessageCreate(m *discordgo.MessageCreate) Message {
 		author:      toAuthor(m.Author),
 		content:     m.Content,
 		attachments: toAttachments(m.Attachments),
+		embeds:      toEmbeds(m.Embeds),
 	}
 }
 
@@ -74,6 +107,7 @@ func fromMessage(m *discordgo.Message) Message {
 		author:      toAuthor(m.Author),
 		content:     m.Content,
 		attachments: toAttachments(m.Attachments),
+		embeds:      toEmbeds(m.Embeds),
 	}
 }
 
@@ -84,5 +118,6 @@ func fromMessageDelete(m *discordgo.MessageDelete) Message {
 		author:      toAuthor(m.Author),
 		content:     m.Content,
 		attachments: toAttachments(m.Attachments),
+		embeds:      toEmbeds(m.Embeds),
 	}
 }

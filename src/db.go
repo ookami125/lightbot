@@ -103,7 +103,12 @@ func selectMessage(message_id int) (Message, error) {
 			continue
 		}
 
-		loadAttachments(message_id)
+		attachments, err := loadAttachments(message_id)
+		if err != nil {
+			logWarning(err)
+		} else {
+			message.attachments = attachments
+		}
 
 		return message, nil
 	}
