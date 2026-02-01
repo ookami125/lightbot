@@ -2,6 +2,7 @@ package main
 
 import (
 	"strconv"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 )
@@ -30,6 +31,7 @@ type Message struct {
 	content     string
 	attachments []Attachment
 	embeds      []Embed
+	createdAt   time.Time
 }
 
 func toIntOr0(str string) int {
@@ -97,6 +99,7 @@ func fromMessageCreate(m *discordgo.MessageCreate) Message {
 		content:     m.Content,
 		attachments: toAttachments(m.Attachments),
 		embeds:      toEmbeds(m.Embeds),
+		createdAt:   m.Timestamp,
 	}
 }
 
@@ -108,6 +111,7 @@ func fromMessage(m *discordgo.Message) Message {
 		content:     m.Content,
 		attachments: toAttachments(m.Attachments),
 		embeds:      toEmbeds(m.Embeds),
+		createdAt:   m.Timestamp,
 	}
 }
 
@@ -119,5 +123,6 @@ func fromMessageDelete(m *discordgo.MessageDelete) Message {
 		content:     m.Content,
 		attachments: toAttachments(m.Attachments),
 		embeds:      toEmbeds(m.Embeds),
+		createdAt:   m.Timestamp,
 	}
 }

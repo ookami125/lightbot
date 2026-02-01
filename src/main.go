@@ -253,7 +253,17 @@ func messageEditHandler(s *discordgo.Session, m *discordgo.MessageUpdate) {
 	}
 
 	if ok {
-		diff := diffMessages(before, after, includeEmbeds)
+		updateTime := time.Now().UTC()
+		if updated.EditedTimestamp != nil {
+			updateTime = *updated.EditedTimestamp
+		}
+
+		ignoreRecentAttachments := false
+		if !updated.Timestamp.IsZero() && updateTime.Sub(updated.Timestamp) <= time.Minute {
+			ignoreRecentAttachments = true
+		}
+
+		diff := diffMessages(before, after, includeEmbeds, ignoreRecentAttachments)
 		if diff.hasChanges() {
 			discordMsg := formatEditLog(updated, diff)
 			s.ChannelMessageSendComplex(channel_id, &discordgo.MessageSend{
@@ -343,7 +353,7 @@ type mediaItem struct {
 	label string
 }
 
-func diffMessages(before, after Message, includeEmbeds bool) MessageDiff {
+func diffMessages(before, after Message, includeEmbeds bool, ignoreRecentAttachments bool) MessageDiff {
 	diff := MessageDiff{
 		beforeContent: before.content,
 		afterContent:  after.content,
@@ -351,9 +361,10 @@ func diffMessages(before, after Message, includeEmbeds bool) MessageDiff {
 
 	diff.contentChanged = before.content != after.content
 
-	diff.attachmentsAdded, diff.attachmentsRemoved = diffMedia(
-		attachmentItems(before.attachments),
-		attachmentItems(after.attachments),
+	diff.attachmentsAdded, diff.attachmentsRemoved = diffAttachments(
+		before.attachments,
+		after.attachments,
+		ignoreRecentAttachments,
 	)
 
 	if includeEmbeds {
@@ -364,6 +375,117 @@ func diffMessages(before, after Message, includeEmbeds bool) MessageDiff {
 	}
 
 	return diff
+}
+
+type attachmentItem struct {
+	key   string
+	label string
+	eqKey string
+}
+
+func diffAttachments(before, after []Attachment, ignoreRecent bool) ([]string, []string) {
+	if ignoreRecent {
+		return nil, nil
+	}
+
+	beforeItems := attachmentItemsWithEquivalence(before)
+	afterItems := attachmentItemsWithEquivalence(after)
+
+	added, removed := diffAttachmentItems(beforeItems, afterItems)
+	added, removed = dropEquivalentAttachmentChanges(added, removed)
+
+	addedLabels := make([]string, 0, len(added))
+	for _, item := range added {
+		addedLabels = append(addedLabels, item.label)
+	}
+
+	removedLabels := make([]string, 0, len(removed))
+	for _, item := range removed {
+		removedLabels = append(removedLabels, item.label)
+	}
+
+	sort.Strings(addedLabels)
+	sort.Strings(removedLabels)
+
+	return addedLabels, removedLabels
+}
+
+func diffAttachmentItems(before, after []attachmentItem) ([]attachmentItem, []attachmentItem) {
+	beforeMap := make(map[string]attachmentItem, len(before))
+	for _, item := range before {
+		beforeMap[item.key] = item
+	}
+	afterMap := make(map[string]attachmentItem, len(after))
+	for _, item := range after {
+		afterMap[item.key] = item
+	}
+
+	added := []attachmentItem{}
+	removed := []attachmentItem{}
+	for key, item := range afterMap {
+		if _, ok := beforeMap[key]; !ok {
+			added = append(added, item)
+		}
+	}
+	for key, item := range beforeMap {
+		if _, ok := afterMap[key]; !ok {
+			removed = append(removed, item)
+		}
+	}
+
+	return added, removed
+}
+
+func dropEquivalentAttachmentChanges(added, removed []attachmentItem) ([]attachmentItem, []attachmentItem) {
+	if len(added) == 0 || len(removed) == 0 {
+		return added, removed
+	}
+
+	addedByKey := make(map[string][]int, len(added))
+	for i, item := range added {
+		addedByKey[item.eqKey] = append(addedByKey[item.eqKey], i)
+	}
+
+	removedByKey := make(map[string][]int, len(removed))
+	for i, item := range removed {
+		removedByKey[item.eqKey] = append(removedByKey[item.eqKey], i)
+	}
+
+	matchedAdded := make(map[int]struct{})
+	matchedRemoved := make(map[int]struct{})
+
+	for key, remIdxs := range removedByKey {
+		addIdxs, ok := addedByKey[key]
+		if !ok {
+			continue
+		}
+		n := len(remIdxs)
+		if len(addIdxs) < n {
+			n = len(addIdxs)
+		}
+		for i := 0; i < n; i++ {
+			matchedRemoved[remIdxs[i]] = struct{}{}
+			matchedAdded[addIdxs[i]] = struct{}{}
+		}
+	}
+
+	filteredAdded := make([]attachmentItem, 0, len(added)-len(matchedAdded))
+	for i, item := range added {
+		if _, ok := matchedAdded[i]; ok {
+			continue
+		}
+		filteredAdded = append(filteredAdded, item)
+	}
+
+	filteredRemoved := make([]attachmentItem, 0, len(removed)-len(matchedRemoved))
+	for i, item := range removed {
+		if _, ok := matchedRemoved[i]; ok {
+			continue
+		}
+		filteredRemoved = append(filteredRemoved, item)
+	}
+
+	return filteredAdded, filteredRemoved
 }
 
 func diffMedia(before, after []mediaItem) ([]string, []string) {
@@ -395,12 +517,13 @@ func diffMedia(before, after []mediaItem) ([]string, []string) {
 	return added, removed
 }
 
-func attachmentItems(attachments []Attachment) []mediaItem {
-	items := make([]mediaItem, 0, len(attachments))
+func attachmentItemsWithEquivalence(attachments []Attachment) []attachmentItem {
+	items := make([]attachmentItem, 0, len(attachments))
 	for _, attachment := range attachments {
-		items = append(items, mediaItem{
+		items = append(items, attachmentItem{
 			key:   attachmentKey(attachment),
 			label: attachmentLabel(attachment),
+			eqKey: attachmentEquivalenceKey(attachment),
 		})
 	}
 	return items
@@ -446,6 +569,18 @@ func attachmentLabel(a Attachment) string {
 	return "attachment"
 }
 
+func attachmentEquivalenceKey(a Attachment) string {
+	if a.filename != "" {
+		return "file:" + a.filename
+	}
+	if a.url != "" {
+		return "url:" + a.url
+	}
+	if a.id != 0 {
+		return fmt.Sprintf("id:%d", a.id)
+	}
+	return attachmentKey(a)
+}
 func embedKey(e Embed) string {
 	return fmt.Sprintf("%s|%s|%s|%s", e.embedType, e.url, e.title, e.provider)
 }
